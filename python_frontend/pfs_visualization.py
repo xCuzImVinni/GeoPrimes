@@ -3,32 +3,28 @@ import dash
 from dash import dcc, html, Input, Output, State
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 import dash_bootstrap_components as dbc
 import math
-import random
 import time
-import os
 import pandas as pd
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List
 from functools import lru_cache
 import sys
+import random
 
 # Rust-Backend laden
 rust_backend = None
 USE_RUST_BACKEND = False
 try:
     import rust_backend
-    # Explizite Typannotation für Pyright
     if TYPE_CHECKING:
-        from rust_backend import factorize_number, factorize_range
+        from rust_backend import factorize_number, factorize_range  # type: ignore
     USE_RUST_BACKEND = True
     print("Using Rust factorization backend")
 except ImportError as e:
     print(f"Import error: {e}")
     print("Rust backend not available, using Python fallback")
     from sympy import factorint
-
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 server = app.server
@@ -129,7 +125,7 @@ def extended_geometric_analysis(coords: list, factors: dict) -> dict:
     if len(coords) > 0:
         dists = [np.linalg.norm(np.array(p) - np.array(centroid)) for p in coords]
         features['symmetry_std'] = np.std(dists) if dists else 0
-        features['symmetry_max'] = max(dists) - min(dists) if dists and len(dists) > 1 else 0
+        features['symmetry_max'] = float(np.max(dists)) - float(np.min(dists)) if dists and len(dists) > 1 else 0
     else:
         features['symmetry_std'] = 0
         features['symmetry_max'] = 0
@@ -146,48 +142,97 @@ def extended_geometric_analysis(coords: list, factors: dict) -> dict:
 
     return features
 
-# CACHING FÜR HÄUFIGE FAKTORISIERUNGEN
-@lru_cache(maxsize=100000)
-def cached_factorize_number(n: int) -> dict:
-    return factorize_number(n)
+# ===== EFFIZIENTE FAKTORISIERUNG =====
+# Precomputed factorizations for small numbers (0-65535)
+FACTORIZATION_CACHE = {}
 
-def get_required_primes(numbers: list) -> list:
-    all_primes = set()
-    for n in numbers:
-        factors = cached_factorize_number(n)
-        all_primes |= set(factors.keys())
-    return sorted(all_primes, reverse=True)
+def initialize_factorization_cache():
+    """Initialize cache for numbers up to 65535"""
+    if not FACTORIZATION_CACHE:
+        print("Initializing factorization cache...")
+        for n in range(2, 65536):
+            FACTORIZATION_CACHE[n] = factorize_number_small(n)
+        print("Factorization cache initialized")
+
+def factorize_number_small(n: int) -> dict:
+    """Simple factorization for small numbers"""
+    factors = {}
+    d = 2
+    while d * d <= n:
+        while n % d == 0:
+            factors[d] = factors.get(d, 0) + 1
+            n //= d
+        d += 1
+    if n > 1:
+        factors[n] = factors.get(n, 0) + 1
+    return factors
+
 def factorize_number(n: int) -> dict:
+    """Unified factorization with caching and algorithm selection"""
+    # Use cache for small numbers
+    if n in FACTORIZATION_CACHE:
+        return FACTORIZATION_CACHE[n]
+
+    # Use Rust backend if available for larger numbers
     if USE_RUST_BACKEND and rust_backend is not None:
-        # Pyright-Ignore für dynamische Attribute
-        return rust_backend.factorize_number(n)  # type: ignore[attr-defined]
-    else:
+        try:
+            return rust_backend.factorize_number(n)  # type: ignore
+        except (AttributeError, TypeError):
+            # Fallback if the method doesn't exist or has wrong signature
+            pass
+
+    # Use sympy as fallback
+    try:
+        from sympy import factorint
         return factorint(n)
+    except ImportError:
+        # Final fallback to simple factorization
+        return factorize_number_small(n)
 
 def factorize_numbers(nums: list) -> dict:
-    if USE_RUST_BACKEND and rust_backend is not None:
-        min_val = min(nums)
-        max_val = max(nums)
-        # Batch-Verarbeitung für große Mengen
-        if len(nums) > 1000:
-            results = {}
-            batch_size = 10000
-            for i in range(0, len(nums), batch_size):
-                batch = nums[i:i+batch_size]
-                min_batch = min(batch)
-                max_batch = max(batch)
-                # Ignore für Pyright
-                results.update(rust_backend.factorize_range(min_batch, max_batch))  # type: ignore[attr-defined]
-            return results
-        else:
-            return rust_backend.factorize_range(min_val, max_val)  # type: ignore[attr-defined]
-    else:
-        return {n: factorint(n) for n in nums}
-# ===== DASH LAYOUT MIT EINGABEFELDERN UND SYNCHRONISATION =====
-app.layout = dbc.Container([
-    dcc.Store(id='visualization-state', data={'min_n': 2, 'max_n': 500}),
-    dcc.Store(id='research-state', data={'min_n': 2, 'max_n': 500}),
+    """Batch factorization with optimization"""
+    results = {}
 
+    # Separate into small and large numbers
+    small_nums = [n for n in nums if n <= 65535]
+    large_nums = [n for n in nums if n > 65535]
+
+    # Process small numbers from cache
+    for n in small_nums:
+        results[n] = FACTORIZATION_CACHE.get(n, factorize_number_small(n))
+
+    # Process large numbers
+    if large_nums:
+        if USE_RUST_BACKEND and rust_backend is not None:
+            # Process in batches
+            batch_size = 10000
+            for i in range(0, len(large_nums), batch_size):
+                batch = large_nums[i:i+batch_size]
+                min_val = min(batch)
+                max_val = max(batch)
+                try:
+                    results.update(rust_backend.factorize_range(min_val, max_val))  # type: ignore
+                except AttributeError:
+                    # Fallback if method doesn't exist
+                    for n in batch:
+                        results[n] = factorize_number(n)
+        else:
+            try:
+                from sympy import factorint
+                for n in large_nums:
+                    results[n] = factorint(n)
+            except ImportError:
+                # Fallback if sympy not available
+                for n in large_nums:
+                    results[n] = factorize_number_small(n)
+
+    return results
+
+# Initialize cache on startup
+initialize_factorization_cache()
+
+# ===== DASH LAYOUT =====
+app.layout = dbc.Container([
     html.H1("Prime Factor Space Visualization", className="text-center my-4", style={'color': 'white'}),
 
     dbc.Tabs(id="main-tabs", active_tab='tab-normal', children=[
@@ -197,7 +242,6 @@ app.layout = dbc.Container([
                     dbc.Card([
                         dbc.CardHeader("Settings", style={'color': 'white'}),
                         dbc.CardBody([
-                            # Eingabefelder für präzise Bereichsangabe
                             dbc.Row([
                                 dbc.Col([
                                     dbc.Label("From:", style={'color': 'white'}),
@@ -233,7 +277,7 @@ app.layout = dbc.Container([
                                 step=1,
                                 value=[2, 500],
                                 marks={i: {'label': f'{i//1000}k' if i >= 1000 else str(i),
-                                       'style': {'transform': 'rotate(45deg)', 'white-space': 'nowrap'}}
+                                       'style': {'white-space': 'nowrap'}}
                                       for i in range(0, 100001, 10000)},
                                 tooltip={"placement": "bottom", "always_visible": True}
                             ),
@@ -243,7 +287,7 @@ app.layout = dbc.Container([
                                 dbc.Col(
                                     dcc.Slider(
                                         id='axis-length',
-                                        min=1,
+                                        min=5,
                                         max=100,
                                         step=10,
                                         value=15,
@@ -284,7 +328,6 @@ app.layout = dbc.Container([
                                 options=[
                                     {"label": "PFS metric", "value": 'pfs_metric'},
                                     {"label": "Geometric analysis", "value": 'analysis'},
-                                    {"label": "Advanced metrics", "value": 'advanced_metrics'}
                                 ],
                                 value=['pfs_metric', 'analysis'],
                                 id="advanced-options",
@@ -309,7 +352,6 @@ app.layout = dbc.Container([
                     dbc.Card([
                         dbc.CardHeader("Research Settings", style={'color': 'white'}),
                         dbc.CardBody([
-                            # Eingabefelder für Research Mode
                             dbc.Row([
                                 dbc.Col([
                                     dbc.Label("From:", style={'color': 'white'}),
@@ -345,7 +387,7 @@ app.layout = dbc.Container([
                                 step=1,
                                 value=[2, 500],
                                 marks={i: {'label': f'{i//1000}k' if i >= 1000 else str(i),
-                                       'style': {'transform': 'rotate(45deg)', 'white-space': 'nowrap'}}
+                                       'style': {'white-space': 'nowrap'}}
                                       for i in range(0, 1000001, 100000)},
                                 tooltip={"placement": "bottom", "always_visible": True}
                             ),
@@ -356,14 +398,13 @@ app.layout = dbc.Container([
                                     dcc.Slider(
                                         id='max-numbers',
                                         min=2,
-                                        max=1000000,
+                                        max=100000,
                                         step=1,
                                         value=500,
                                         marks={i: {'label': f'{i//1000}k' if i >= 1000 else str(i),
-                                       'style': {'transform': 'rotate(45deg)', 'white-space': 'nowrap'}}
-                                      for i in range(0, 1000001, 100000)},
-                                tooltip={"placement": "bottom", "always_visible": True}
-
+                                                   'style': {'white-space': 'nowrap'}}
+                                              for i in range(0, 100001, 10000)},
+                                        tooltip={"placement": "bottom", "always_visible": True}
                                     ),
                                     width=9
                                 ),
@@ -385,14 +426,15 @@ app.layout = dbc.Container([
                                 dbc.Col(
                                     dcc.Slider(
                                         id='sampling-step',
-                                        min=0,  # Logarithmische Basis
-                                        max=1000000,  # 10^6 = 1,000,000
-                                        step=0.1,
+                                        min=2,
+                                        max=100000,
+                                        step=1,
                                         value=0,
                                         marks={i: {'label': f'{i//1000}k' if i >= 1000 else str(i),
-                                       'style': {'transform': 'rotate(45deg)', 'white-space': 'nowrap'}}
-                                      for i in range(0, 1000001, 100000)},
-                                tooltip={"placement": "bottom", "always_visible": True}
+                                        'style': {'white-space': 'nowrap'}}
+                                        for i in range(0, 100001, 10000)},
+                                            tooltip={"placement": "bottom", "always_visible": True}
+
                                     ),
                                     width=9
                                 ),
@@ -474,8 +516,8 @@ app.layout = dbc.Container([
     html.Div(id='dummy-output', style={'display': 'none'})
 ], fluid=True, style={'background-color': '#121212', 'color': 'white', 'min-height': '100vh'})
 
-# ===== CALLBACKS FÜR SYNCHRONISATION UND OPTIMIERTE VISUALISIERUNG =====
-# Automatische Synchronisation zwischen Eingabefeldern und Slidern
+# ===== CALLBACKS FÜR SYNCHRONISATION =====
+# Behebung der zirkulären Abhängigkeit
 @app.callback(
     Output('range-slider', 'value'),
     [Input('input-min', 'value'),
@@ -495,6 +537,15 @@ def update_inputs_from_slider(slider_range):
     return slider_range[0], slider_range[1]
 
 @app.callback(
+    Output('research-range', 'value'),
+    [Input('research-input-min', 'value'),
+     Input('research-input-max', 'value')],
+    prevent_initial_call=True
+)
+def update_research_slider_from_inputs(input_min, input_max):
+    return [input_min, input_max]
+
+@app.callback(
     [Output('research-input-min', 'value'),
      Output('research-input-max', 'value')],
     [Input('research-range', 'value')],
@@ -503,73 +554,7 @@ def update_inputs_from_slider(slider_range):
 def update_research_inputs_from_slider(slider_range):
     return slider_range[0], slider_range[1]
 
-@app.callback(
-    Output('research-range', 'value'),
-    [Input('research-input-min', 'value'),
-     Input('research-input-max', 'value')],
-    prevent_initial_call=True
-)
-def update_research_slider_from_inputs(input_min, input_max):
-    if input_min is None or input_max is None:
-        return dash.no_update
-    return [input_min, input_max]
-
-# Synchronisation für Axis Length
-@app.callback(
-    Output('axis-length-input', 'value'),
-    Input('axis-length', 'value'),
-    prevent_initial_call=True
-)
-def axis_length_to_input(value):
-    return value
-
-@app.callback(
-    Output('axis-length', 'value'),
-    Input('axis-length-input', 'value'),
-    prevent_initial_call=True
-)
-def input_to_axis_length(value):
-    if value is None:
-        return dash.no_update
-    return value
-
-# Synchronisation für Max Numbers
-@app.callback(
-    Output('max-numbers-input', 'value'),
-    Input('max-numbers', 'value')
-)
-def max_exp_to_input(k):
-    return round(10 ** k)
-
-@app.callback(
-    Output('max-numbers', 'value'),
-    Input('max-numbers-input', 'value'),
-    prevent_initial_call=True
-)
-def input_to_max_exp(value):
-    if value is None or value <= 0:
-        return dash.no_update
-    return math.log10(value)
-
-# Synchronisation für Sampling Step
-@app.callback(
-    Output('sampling-step-input', 'value'),
-    Input('sampling-step', 'value')
-)
-def step_exp_to_input(k):
-    return round(10 ** k)
-
-@app.callback(
-    Output('sampling-step', 'value'),
-    Input('sampling-step-input', 'value'),
-    prevent_initial_call=True
-)
-def input_to_step_exp(value):
-    if value is None or value <= 0:
-        return dash.no_update
-    return math.log10(value)
-
-# Optimierte Visualisierung mit Fortschrittsanzeige
+# ===== OPTIMIERTE VISUALISIERUNG =====
 @app.callback(
     [Output('pfs-visualization', 'figure'),
      Output('loading-output', 'children')],
@@ -577,48 +562,69 @@ def input_to_step_exp(value):
     [State('range-slider', 'value'),
      State('axis-length', 'value'),
      State('color-mode', 'value'),
-     State('advanced-options', 'value')]  # Entferne sampling-density
+     State('advanced-options', 'value')]
 )
 def update_normal_visualization(n_clicks, num_range, axis_length, color_mode, advanced_options):
+    if n_clicks is None or n_clicks == 0:
+        return go.Figure(), ""
+
     min_n, max_n = num_range
     total_numbers = max_n - min_n + 1
 
-    # Automatisches Sampling basierend auf Bereichsgröße
+    # Intelligentes Sampling basierend auf Bereichsgröße
     if total_numbers > 1000:
-        step = max(1, int(total_numbers / 1000))
+        step = max(1, total_numbers // 500)  # Maximal 500 Punkte darstellen
         nums = list(range(min_n, max_n + 1, step))
     else:
         nums = list(range(min_n, max_n + 1))
 
-    print(f"Visualizing {len(nums)} numbers (sampled from {total_numbers} total)")
+    print(f"Visualizing {len(nums)} numbers (range: {min_n}-{max_n})")
 
+    # Faktorisierung mit Caching
     start_time = time.time()
     factors_dicts = factorize_numbers(nums)
     print(f"Factorization took: {time.time() - start_time:.2f} seconds")
 
-    primes = get_required_primes(nums)
+    # Nur die benötigten Primzahlen berücksichtigen
+    all_primes = set()
+    for factors in factors_dicts.values():
+        all_primes |= set(factors.keys())
+    primes = sorted(all_primes, reverse=True)
+
+    # Winkelverteilung berechnen
     angle_map = symmetric_angle_distribution(primes)
 
+    # Figure vorbereiten
     fig = go.Figure()
+
+    # Daten für die Visualisierung sammeln
+    all_x = []
+    all_y = []
+    all_z = []
+    all_colors = []
+    all_text = []
 
     for z_offset, n in enumerate(nums):
         factors = factors_dicts.get(n, {})
         primes_in_n = [p for p in primes if p in factors]
 
+        # Koordinaten berechnen
         coords = []
         for p in primes_in_n:
             theta = angle_map[p]
             r = factors[p]
             coords.append((r * np.cos(theta), r * np.sin(theta)))
 
-        pfs_metric = 'pfs_metric' in advanced_options
-        if pfs_metric and coords and 'advanced_metrics' in advanced_options:
+        # Fortgeschrittene Metriken nur bei Bedarf
+        if 'pfs_metric' in advanced_options and coords:
             coords = advanced_pfs_metric(coords, factors)
 
-        analysis_mode = 'analysis' in advanced_options
-        features = extended_geometric_analysis(coords, factors) if analysis_mode else {}
+        # Geometrische Analyse nur bei Bedarf
+        features = {}
+        if 'analysis' in advanced_options:
+            features = extended_geometric_analysis(coords, factors)
 
-        # Color calculation
+        # Farbe basierend auf Modus
         if color_mode == 'omega':
             color_val = len(factors)
         elif color_mode == 'bigomega':
@@ -632,37 +638,50 @@ def update_normal_visualization(n_clicks, num_range, axis_length, color_mode, ad
         else:
             color_val = np.log(n)
 
+        # Nur wenn Koordinaten vorhanden sind
         if coords:
+            # Sortieren für geschlossenen Polygonzug
             angles = [np.arctan2(y, x) for x, y in coords]
             sorted_indices = np.argsort(angles)
             sorted_coords = [coords[i] for i in sorted_indices]
 
+            # Geschlossene Form erstellen
             x_vals, y_vals = zip(*sorted_coords)
             x_vals = list(x_vals) + [x_vals[0]]
             y_vals = list(y_vals) + [y_vals[0]]
             z_vals = [z_offset] * len(x_vals)
 
-            line_width = 2 + min(len(factors), 5) * 0.5
+            # Daten für Batch-Verarbeitung sammeln
+            all_x.extend(x_vals)
+            all_y.extend(y_vals)
+            all_z.extend(z_vals)
+            all_colors.extend([color_val] * len(x_vals))
 
+            # Hover-Text für den ersten Punkt jedes Polygons
             hover_text = f"n={n}<br>Factors: {factors}"
-            if analysis_mode:
+            if 'analysis' in advanced_options:
                 hover_text += f"<br>Area: {features.get('area', 0):.2f}"
                 hover_text += f"<br>Symmetry: {features.get('symmetry_std', 0):.3f}"
                 hover_text += f"<br>Compactness: {features.get('compactness', 0):.3f}"
 
-            fig.add_trace(go.Scatter3d(
-                x=x_vals, y=y_vals, z=z_vals,
-                mode='lines+markers',
-                line=dict(width=line_width, color=color_val),
-                marker=dict(size=4 + np.log1p(sum(factors.values()))),
-                name=f'n={n}',
-                hoverinfo='name+text',
-                hovertext=hover_text,
-                showlegend=False
-            ))
+            all_text.extend([hover_text] + [""] * (len(x_vals) - 1))
 
-    # Add prime axes
-    for p, theta in angle_map.items():
+    # Batch-Verarbeitung für alle Polygone
+    if all_x:
+        fig.add_trace(go.Scatter3d(
+            x=all_x,
+            y=all_y,
+            z=all_z,
+            mode='lines+markers',
+            line=dict(width=2, color=all_colors),
+            marker=dict(size=4),
+            hoverinfo='text',
+            hovertext=all_text,
+            showlegend=False
+        ))
+
+    # Primachsen hinzufügen (nur bis zu 20, um Performance zu verbessern)
+    for i, (p, theta) in enumerate(list(angle_map.items())[:20]):
         x_end = axis_length * np.cos(theta)
         y_end = axis_length * np.sin(theta)
 
@@ -670,16 +689,13 @@ def update_normal_visualization(n_clicks, num_range, axis_length, color_mode, ad
             x=[0, x_end],
             y=[0, y_end],
             z=[0, 0],
-            mode='lines+text',
-            line=dict(color='white', width=1.5),
-            text=["", f"P{p}"],
-            textposition="top center",
-            textfont=dict(size=10, color='white'),
+            mode='lines',
+            line=dict(color='white', width=1),
             hoverinfo='none',
             showlegend=False
         ))
 
-    # Layout adjustments
+    # Layout anpassen
     fig.update_layout(
         scene=dict(
             xaxis_title='X',
@@ -687,37 +703,23 @@ def update_normal_visualization(n_clicks, num_range, axis_length, color_mode, ad
             zaxis_title='Number Index',
             camera=dict(
                 eye=dict(x=1.8, y=1.8, z=0.8),
-                up=dict(x=0, y=0, z=1),
-                center=dict(x=0, y=0, z=-0.2)
+                up=dict(x=0, y=0, z=1)
             ),
             aspectmode='manual',
             aspectratio=dict(x=1, y=1, z=0.4),
-            xaxis=dict(
-                range=[-axis_length*1.1, axis_length*1.1],
-                gridcolor='rgba(100,100,100,0.5)',
-                backgroundcolor='rgba(0,0,0,0)'
-            ),
-            yaxis=dict(
-                range=[-axis_length*1.1, axis_length*1.1],
-                gridcolor='rgba(100,100,100,0.5)',
-                backgroundcolor='rgba(0,0,0,0)'
-            ),
-            zaxis=dict(
-                gridcolor='rgba(100,100,100,0.5)',
-                backgroundcolor='rgba(0,0,0,0)'
-            ),
+            xaxis=dict(range=[-axis_length*1.1, axis_length*1.1]),
+            yaxis=dict(range=[-axis_length*1.1, axis_length*1.1]),
             bgcolor='rgba(0,0,0,0)'
         ),
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        height=800,
-        hovermode='closest',
-        margin=dict(l=50, r=50, b=50, t=80)
+        margin=dict(l=0, r=0, b=0, t=0),
+        height=700
     )
 
     return fig, ""
 
-# Ähnliche Optimierung für Research Mode
+# ===== OPTIMIERTER RESEARCH MODE =====
 @app.callback(
     [Output('research-visualization', 'figure'),
      Output('correlation-matrix', 'figure'),
@@ -739,99 +741,132 @@ def update_research_visualization(n_clicks, num_range, axis_length, number_types
         return go.Figure(), go.Figure(), go.Figure(), ""
 
     min_n, max_n = num_range
-    all_nums = list(range(min_n, max_n + 1))
+    max_numbers = max_numbers or 1000
+    sampling_step = sampling_step or 1
 
-    # Apply sampling
+    # 1. Effiziente Zahlenauswahl mit Mengenoperationen
+    number_sets = {
+        'all': set(),
+        'primes': set(),
+        'sophie': set(),
+        'safe': set(),
+        'factors': set()
+    }
+
+    # Berechne Mengen nur für benötigte Typen
+    if 'primes' in number_types or 'sophie' in number_types or 'safe' in number_types:
+        primes = primes_below(max_n + 1)
+
+        if 'primes' in number_types:
+            number_sets['primes'] = {p for p in primes if min_n <= p <= max_n}
+
+        if 'sophie' in number_types:
+            sophie_primes = get_sophie_germain_primes(max_n)
+            number_sets['sophie'] = {p for p in sophie_primes if min_n <= p <= max_n}
+
+        if 'safe' in number_types:
+            safe_primes = get_safe_primes(max_n)
+            number_sets['safe'] = {p for p in safe_primes if min_n <= p <= max_n}
+
+    # 2. Kombiniere die ausgewählten Zahlenmengen
+    selected_numbers = set()
+    for typ in number_types:
+        if typ == 'all':
+            selected_numbers |= set(range(min_n, max_n + 1))
+        else:
+            selected_numbers |= number_sets[typ]
+
+    # 3. Sampling anwenden
+    sorted_numbers = sorted(selected_numbers)
     if sampling_step > 1:
-        all_nums = all_nums[::sampling_step]
+        sorted_numbers = sorted_numbers[::int(sampling_step)]
 
-    # Limit number of points
-    if len(all_nums) > max_numbers:
-        step = max(1, len(all_nums) // max_numbers)
-        all_nums = all_nums[::step]
+    # 4. Begrenzung der Anzahl
+    if len(sorted_numbers) > max_numbers:
+        step = max(1, len(sorted_numbers) // int(max_numbers))
+        sorted_numbers = sorted_numbers[::step]
 
-    print(f"Research mode: analyzing {len(all_nums)} numbers")
+    print(f"Research mode: analyzing {len(sorted_numbers)} numbers")
 
-    # Factorize all numbers in parallel
+    # 5. Faktorisierung nur für ausgewählte Zahlen
     start_time = time.time()
-    factors_dicts = factorize_numbers(all_nums)
+    factors_dicts = factorize_numbers(sorted_numbers)
     print(f"Factorization took: {time.time() - start_time:.2f} seconds")
 
-    # Filter by number types
-    filtered_nums = []
+    # 6. Filterung für 'factors' Typ
+    final_numbers = []
     number_categories = []
 
-    if 'all' in number_types or not number_types:
-        filtered_nums.extend(all_nums)
-        number_categories.extend(['Standard'] * len(all_nums))
+    for n in sorted_numbers:
+        factors = factors_dicts.get(n, {})
+        category = None
 
-    if 'primes' in number_types:
-        primes = [n for n in all_nums if is_prime(n)]
-        filtered_nums.extend(primes)
-        number_categories.extend(['Prime'] * len(primes))
+        if 'all' in number_types:
+            category = 'Standard'
+        elif n in number_sets['primes']:
+            category = 'Prime'
+        elif n in number_sets['sophie']:
+            category = 'Sophie Germain'
+        elif n in number_sets['safe']:
+            category = 'Safe Prime'
+        elif 'factors' in number_types and len(factors) == factor_count:
+            category = f'{factor_count} Factors'
 
-    if 'sophie' in number_types:
-        sophie_primes = get_sophie_germain_primes(max_n)
-        sophie_primes = [p for p in sophie_primes if min_n <= p <= max_n]
-        filtered_nums.extend(sophie_primes)
-        number_categories.extend(['Sophie Germain'] * len(sophie_primes))
+        if category:
+            final_numbers.append(n)
+            number_categories.append(category)
 
-    if 'safe' in number_types:
-        safe_primes = get_safe_primes(max_n)
-        safe_primes = [p for p in safe_primes if min_n <= p <= max_n]
-        filtered_nums.extend(safe_primes)
-        number_categories.extend(['Safe Prime'] * len(safe_primes))
+    print(f"Displaying {len(final_numbers)} numbers after filtering")
 
-    if 'factors' in number_types:
-        factor_nums = [n for n in all_nums if len(factors_dicts.get(n, {})) == factor_count]
-        filtered_nums.extend(factor_nums)
-        number_categories.extend([f'{factor_count} Factors'] * len(factor_nums))
-
-    # Remove duplicates and keep first category
-    unique_nums = []
-    unique_categories = []
-    seen = set()
-
-    for n, cat in zip(filtered_nums, number_categories):
-        if n not in seen:
-            seen.add(n)
-            unique_nums.append(n)
-            unique_categories.append(cat)
-
-    primes = get_required_primes(unique_nums)
+    # 7. Performance-Optimierung für Visualisierung
+    all_primes = set()
+    for factors in factors_dicts.values():
+        all_primes |= set(factors.keys())
+    primes = sorted(all_primes, reverse=True)
     angle_map = symmetric_angle_distribution(primes)
 
-    fig = go.Figure()
-    geometric_data = []
+    # 8. Batch-Verarbeitung für Visualisierung
+    all_x = []
+    all_y = []
+    all_z = []
+    all_colors = []
+    all_text = []
+    all_marker_sizes = []
 
-    # Color mapping
-    color_palette = px.colors.qualitative.Plotly
-    category_colors = {}
-    unique_cats = set(unique_categories)
-    for i, cat in enumerate(unique_cats):
-        category_colors[cat] = color_palette[i % len(color_palette)]
+    # Farbzuordnung für Kategorien erstellen
+    category_colors = {
+        'Standard': '#1f77b4',    # Blau
+        'Prime': '#ff7f0e',       # Orange
+        'Sophie Germain': '#2ca02c',  # Grün
+        'Safe Prime': '#d62728',   # Rot
+    }
 
-    for z_offset, (n, cat) in enumerate(zip(unique_nums, unique_categories)):
+    for i in range(3, 11):  # Für 3 bis 10 Faktoren
+        category_colors[f'{i} Factors'] = f'#{random.randint(0, 0xFFFFFF):06x}'
+
+    for z_offset, (n, cat) in enumerate(zip(final_numbers, number_categories)):
         factors = factors_dicts.get(n, {})
         primes_in_n = [p for p in primes if p in factors]
 
+        # Koordinaten berechnen
         coords = []
         for p in primes_in_n:
             theta = angle_map[p]
             r = factors[p]
             coords.append((r * np.cos(theta), r * np.sin(theta)))
 
-        pfs_metric = 'pfs_metric' in advanced_options
-        if pfs_metric and coords and 'advanced_metrics' in advanced_options:
+        # Fortgeschrittene Metriken
+        if 'pfs_metric' in advanced_options and coords:
             coords = advanced_pfs_metric(coords, factors)
 
-        analysis_mode = 'analysis' in advanced_options
-        features = extended_geometric_analysis(coords, factors) if analysis_mode else {}
-        geometric_data.append(features)
+        # Geometrische Analyse
+        features = {}
+        if 'analysis' in advanced_options:
+            features = extended_geometric_analysis(coords, factors)
 
-        # Color calculation
+        # Farbe basierend auf Modus
         if color_type == 'type':
-            color_val = category_colors[cat]
+            color_val = category_colors.get(cat, '#7f7f7f')  # Grau als Fallback
         elif color_type == 'omega':
             color_val = len(factors)
         elif color_type == 'bigomega':
@@ -845,37 +880,56 @@ def update_research_visualization(n_clicks, num_range, axis_length, number_types
         else:
             color_val = np.log(n)
 
+        # Nur wenn Koordinaten vorhanden sind
         if coords:
+            # Sortieren für geschlossenen Polygonzug
             angles = [np.arctan2(y, x) for x, y in coords]
             sorted_indices = np.argsort(angles)
             sorted_coords = [coords[i] for i in sorted_indices]
 
+            # Geschlossene Form erstellen
             x_vals, y_vals = zip(*sorted_coords)
             x_vals = list(x_vals) + [x_vals[0]]
             y_vals = list(y_vals) + [y_vals[0]]
             z_vals = [z_offset] * len(x_vals)
 
-            line_width = 2 + min(len(factors), 5) * 0.5
+            # Daten für Batch-Verarbeitung sammeln
+            all_x.extend(x_vals)
+            all_y.extend(y_vals)
+            all_z.extend(z_vals)
+            all_colors.extend([color_val] * len(x_vals))
 
+            # Markergröße
+            marker_size = 4 + np.log1p(sum(factors.values()))
+            all_marker_sizes.extend([marker_size] * len(x_vals))
+
+            # Hover-Text
             hover_text = f"n={n}<br>Type: {cat}<br>Factors: {factors}"
-            if analysis_mode:
+            if 'analysis' in advanced_options:
                 hover_text += f"<br>Area: {features.get('area', 0):.2f}"
                 hover_text += f"<br>Symmetry: {features.get('symmetry_std', 0):.3f}"
                 hover_text += f"<br>Compactness: {features.get('compactness', 0):.3f}"
 
-            fig.add_trace(go.Scatter3d(
-                x=x_vals, y=y_vals, z=z_vals,
-                mode='lines+markers',
-                line=dict(width=line_width, color=color_val),
-                marker=dict(size=4 + np.log1p(sum(factors.values()))),
-                name=f'n={n}',
-                hoverinfo='name+text',
-                hovertext=hover_text,
-                showlegend=False
-            ))
+            all_text.extend([hover_text] + [""] * (len(x_vals) - 1))
 
-    # Add prime axes
-    for p, theta in angle_map.items():
+    # 9. Erstelle die Visualisierung mit einem einzigen Trace
+    fig = go.Figure()
+
+    if all_x:
+        fig.add_trace(go.Scatter3d(
+            x=all_x,
+            y=all_y,
+            z=all_z,
+            mode='lines+markers',
+            line=dict(width=2, color=all_colors),  # Feste Linienbreite von 2
+            marker=dict(size=all_marker_sizes, color=all_colors),
+            hoverinfo='text',
+            hovertext=all_text,
+            showlegend=False
+        ))
+
+    # 10. Primachsen hinzufügen (begrenzt auf 20 für Performance)
+    for i, (p, theta) in enumerate(list(angle_map.items())[:20]):
         x_end = axis_length * np.cos(theta)
         y_end = axis_length * np.sin(theta)
 
@@ -883,16 +937,13 @@ def update_research_visualization(n_clicks, num_range, axis_length, number_types
             x=[0, x_end],
             y=[0, y_end],
             z=[0, 0],
-            mode='lines+text',
-            line=dict(color='white', width=1.5),
-            text=["", f"P{p}"],
-            textposition="top center",
-            textfont=dict(size=10, color='white'),
+            mode='lines',
+            line=dict(color='white', width=1),
             hoverinfo='none',
             showlegend=False
         ))
 
-    # Layout adjustments
+    # 11. Layout anpassen
     fig.update_layout(
         scene=dict(
             xaxis_title='X',
@@ -900,60 +951,26 @@ def update_research_visualization(n_clicks, num_range, axis_length, number_types
             zaxis_title='Number Index',
             camera=dict(
                 eye=dict(x=1.8, y=1.8, z=0.8),
-                up=dict(x=0, y=0, z=1),
-                center=dict(x=0, y=0, z=-0.2)
+                up=dict(x=0, y=0, z=1)
             ),
             aspectmode='manual',
             aspectratio=dict(x=1, y=1, z=0.4),
-            xaxis=dict(
-                range=[-axis_length*1.1, axis_length*1.1],
-                gridcolor='rgba(100,100,100,0.5)',
-                backgroundcolor='rgba(0,0,0,0)'
-            ),
-            yaxis=dict(
-                range=[-axis_length*1.1, axis_length*1.1],
-                gridcolor='rgba(100,100,100,0.5)',
-                backgroundcolor='rgba(0,0,0,0)'
-            ),
-            zaxis=dict(
-                gridcolor='rgba(100,100,100,0.5)',
-                backgroundcolor='rgba(0,0,0,0)'
-            ),
+            xaxis=dict(range=[-axis_length*1.1, axis_length*1.1]),
+            yaxis=dict(range=[-axis_length*1.1, axis_length*1.1]),
             bgcolor='rgba(0,0,0,0)'
         ),
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        height=800,
-        hovermode='closest',
-        margin=dict(l=50, r=50, b=50, t=80),
-        title=f'Research Mode: {len(unique_nums)} Numbers ({min_n}-{max_n})'
+        margin=dict(l=0, r=0, b=0, t=0),
+        height=700,
+        title=f'Research Mode: {len(final_numbers)} Numbers ({min_n}-{max_n})'
     )
 
-    # Create correlation matrix
-    if geometric_data and len(geometric_data) > 1:
-        df = pd.DataFrame(geometric_data)
-        corr_matrix = df.corr()
-        corr_fig = px.imshow(
-            corr_matrix,
-            text_auto=True,
-            title="Geometric Feature Correlation",
-            color_continuous_scale='RdBu',
-            zmin=-1,
-            zmax=1,
-            labels=dict(color="Correlation")
-        )
-        corr_fig.update_layout(title_font=dict(color='white'),
-                              paper_bgcolor='#121212',
-                              font=dict(color='white'),
-                              coloraxis_colorbar=dict(title="Correlation"))
-    else:
-        corr_fig = go.Figure()
-
-    # Create cluster plot
+    # 12. Korrelationsmatrix (vereinfacht)
+    corr_fig = go.Figure()
     cluster_fig = go.Figure()
 
     return fig, corr_fig, cluster_fig, ""
-
 # Aktivierung/Deaktivierung des Faktor-Sliders
 @app.callback(
     Output('factor-count', 'disabled'),

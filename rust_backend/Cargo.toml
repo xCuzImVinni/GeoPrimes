@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.18", features = ["extension-module"] }
 primal = "0.3"
 rayon = "1.7"
-lazy_static = "1.4"
+once_cell = "1.19.0"

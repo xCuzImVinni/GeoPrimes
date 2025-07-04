@@ -1,9 +1,8 @@
-#[macro_use]
-extern crate lazy_static;
+use pyo3::prelude::*;
+use pyo3::wrap_pyfunction;
 
 mod factorize;
 use factorize::{factorize_number, factorize_range};
-use pyo3::prelude::*;
 
 #[pymodule]
 fn rust_backend(_py: Python, m: &PyModule) -> PyResult<()> {
